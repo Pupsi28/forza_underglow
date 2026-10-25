@@ -1,237 +1,228 @@
 # /// script
-# requires-python = ">=3.10,<3.13"
-# dependencies = [
-#   "ultralytics>=8.3.0", "mss>=9.0", "PySide6>=6.5", "opencv-python>=4.8", "numpy",
-#   "torch", "torchvision", "dxcam; sys_platform == 'win32'",
-# ]
-# [tool.uv.sources]
-# torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32'" }]
-# torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32'" }]
-# [[tool.uv.index]]
-# name = "pytorch-cu126"
-# url = "https://download.pytorch.org/whl/cu126"
-# explicit = true
+# requires-python = ">=3.10"
+# dependencies = ["PySide6>=6.5", "numpy"]
 # ///
-"""Forza Underglow Overlay.
+"""Forza Underglow Overlay (Telemetrie-Version).
 
-Erfasst den Bildschirm, segmentiert Autos mit YOLO und zeichnet eine
-Unterbodenbeleuchtung als transparentes, klick-durchlässiges Overlay.
-
-Perspektiven-Trick: Statt einer festen Ellipse wird aus der Segmentierungsmaske
-die Unterkante des Autos (Reifen/Schweller) bestimmt. Deren konvexe Hülle ist
-eine gute Näherung des Fußabdrucks auf dem Boden – egal ob Seiten-, Heck- oder
-Schrägansicht. Die Karosserie verdeckt den Lichtschein von oben.
+Liest Forzas "Data Out"-Telemetrie (UDP) und zeichnet eine Unterbodenbeleuchtung
+als transparentes Overlay. Keine Bilderkennung: In der Verfolgerkamera steht das
+Spieler-Auto immer an ungefähr derselben Bildschirmstelle. Der Lichtschein wird als
+Textur auf einer virtuellen Bodenebene berechnet und perspektivisch auf den
+Bildschirm projiziert. Die Telemetrie bewegt ihn mit:
+  - Driftwinkel / Gierrate  -> Auto dreht sich auf dem Bildschirm, Licht dreht mit
+  - Federweg pro Rad        -> eingefederte Ecke näher am Boden = heller
+  - Längsbeschleunigung     -> Kamera fällt zurück / holt auf (Zoom)
+Seiten des Autos, die von der Kamera wegzeigen, werden von der Karosserie verdeckt.
 """
 import argparse
 import colorsys
 import ctypes
+import json
+import math
 import signal
+import socket
+import struct
 import sys
 import threading
 import time
+from pathlib import Path
 
-import cv2
-import mss
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
-from ultralytics import YOLO
 
-VEHICLES = [2, 3, 7]  # COCO: car, motorcycle, truck
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Underglow-Overlay für Forza Horizon")
-    p.add_argument("--color", default="#00e5ff", help="Hex-Farbe oder 'rainbow'")
-    p.add_argument("--intensity", type=float, default=0.85, help="0..1")
-    p.add_argument("--spread", type=float, default=1.0, help="Größe des Lichtscheins")
-    p.add_argument("--all-cars", action="store_true", help="Alle Autos beleuchten, nicht nur das eigene")
-    p.add_argument("--model", default="yolo11n-seg.pt", help="YOLO-Segmentierungsmodell")
-    p.add_argument("--conf", type=float, default=0.25, help="Erkennungsschwelle")
-    p.add_argument("--imgsz", type=int, default=416, help="Eingangsgröße der Erkennung (kleiner = schneller)")
-    p.add_argument("--monitor", type=int, default=1, help="Monitor-Index (1 = primär)")
-    p.add_argument("--work-width", type=int, default=640, help="Interne Auflösung")
-    p.add_argument("--smooth", type=float, default=0.5, help="Zeitliche Glättung 0..1 (kleiner = ruhiger)")
-    p.add_argument("--max-fps", type=float, default=60)
-    p.add_argument("--no-hud", action="store_true", help="Statusanzeige oben links ausblenden")
-    return p.parse_args()
-
-
-def hex_rgb(s):
-    s = s.lstrip("#")
-    return np.array([int(s[i:i + 2], 16) for i in (0, 2, 4)], np.float32) / 255
+CONFIG_PATH = Path(__file__).with_name("config.json")
+DEFAULTS = {
+    "port": 1306,
+    "color": "#00e5ff",       # Hex-Farbe oder "rainbow"
+    "intensity": 0.9,
+    "anchor_x": 0.5,          # Bildschirmposition der Fahrzeugmitte am Boden (0..1)
+    "anchor_y": 0.73,
+    "scale": 0.85,            # Größe auf dem Bildschirm
+    "cam_height": 1.8,        # virtuelle Verfolgerkamera in Metern -> Perspektive
+    "cam_dist": 6.0,
+    "car_length": 4.4,
+    "car_width": 1.9,
+    "glow_reach": 0.9,        # wie weit das Licht über den Wagenrand reicht (Meter)
+    "slip_follow": 0.6,       # wie stark sich das Auto beim Driften auf dem Bildschirm dreht
+    "yaw_lag": 0.0,           # zusätzliche Drehung pro rad/s Gierrate (Vorzeichen ggf. umdrehen)
+    "lateral_shift": 0.0,     # seitlicher Versatz pro m/s² Querbeschleunigung (Bildschirmanteil)
+    "accel_zoom": 0.004,      # Größenänderung pro m/s² Längsbeschleunigung
+    "smoothing": 0.2,         # 0..1, kleiner = ruhiger
+}
+COLORS = ["#00e5ff", "#ff00d4", "#ff1a1a", "#00ff66", "#2050ff", "#9a30ff", "#ffffff", "#ff8800", "rainbow"]
 
 
-class GlowRenderer:
-    """Rechnet mit halber Arbeitsauflösung und nur in einem Ausschnitt um jedes Auto (schnell)."""
-
-    def __init__(self, args, work_size):
-        self.args = args
-        self.scale = 0.5
-        self.w, self.h = int(work_size[0] * self.scale), int(work_size[1] * self.scale)
-        self.acc = np.zeros((self.h, self.w), np.float32)
-        self.rainbow = args.color.lower() == "rainbow"
-        self.rgb = None if self.rainbow else hex_rgb(args.color)
-
-    def car_glow(self, poly, glow, occl):
-        """Lichtschein + Verdeckung für ein Auto in glow/occl eintragen."""
-        poly = (poly * self.scale).astype(np.int32)
-        x, y, w, h = cv2.boundingRect(poly)
-        if w < 6 or h < 4:
-            return
-        size = max(w, h) * self.args.spread
-        m = int(size * 0.4) + 2
-        x0, y0, x1, y1 = max(x - m, 0), max(y - m, 0), min(x + w + m, self.w), min(y + h + m, self.h)
-        rw, rh, lx, ly = x1 - x0, y1 - y0, x - x0, y - y0
-
-        mask = np.zeros((rh, rw), np.uint8)
-        cv2.fillPoly(mask, [poly - (x0, y0)], 1)
-
-        # Unterkante: unterster Maskenpixel pro Spalte
-        sub = mask[ly:ly + h, lx:lx + w]
-        cols = np.where(sub.any(0))[0]
-        if len(cols) < 3:
-            return
-        bottom = h - 1 - np.argmax(sub[::-1, cols], axis=0)
-        pts = np.stack([cols + lx, bottom + ly], 1)
-        pts = pts[pts[:, 1] > ly + 0.5 * h]  # nur echte Unterkante, keine Dachlinie
-        if len(pts) < 3:
-            return
-
-        foot = np.zeros((rh, rw), np.float32)
-        cv2.fillConvexPoly(foot, cv2.convexHull(pts.astype(np.int32)), 1.0)
-        # Lichtpool leicht nach unten versetzt (liegt auf dem Boden statt am Blech),
-        # horizontal breiter als vertikal (Bodenebene ist perspektivisch verkürzt)
-        pool = np.roll(foot, int(size * 0.025), axis=0)
-        g = cv2.GaussianBlur(pool, (0, 0), sigmaX=size * 0.09, sigmaY=size * 0.05) * 2.4
-        g += cv2.GaussianBlur(foot, (0, 0), sigmaX=size * 0.02) * 0.6
-        # Heller LED-Saum direkt an der Unterkante
-        strip = np.zeros_like(foot)
-        cv2.polylines(strip, [pts.reshape(-1, 1, 2).astype(np.int32)], False, 1.0,
-                      max(1, int(size * 0.012)))
-        g += cv2.GaussianBlur(strip, (0, 0), max(size * 0.01, 0.5)) * 0.7
-
-        # Karosserie verdeckt das Licht – nach unten hin (Schweller) lässt sie es durch
-        ramp = np.clip((np.arange(rh, dtype=np.float32) - (ly + 0.65 * h)) / (0.35 * h), 0, 1)
-        o = mask.astype(np.float32) * (1 - 0.45 * ramp)[:, None]
-        np.maximum(glow[y0:y1, x0:x1], g, out=glow[y0:y1, x0:x1])
-        np.maximum(occl[y0:y1, x0:x1], o, out=occl[y0:y1, x0:x1])
-
-    def render(self, polys):
-        """Liefert (RGBA-Bild, geänderter Bereich als (x0, y0, x1, y1) relativ 0..1 oder None)."""
-        glow = np.zeros((self.h, self.w), np.float32)
-        occl = np.zeros_like(glow)
-        for poly in polys:
-            self.car_glow(poly, glow, occl)
-        glow = np.clip(glow, 0, 1) * (1 - 0.95 * occl)
-
-        a = self.args.smooth
-        self.acc = self.acc * (1 - a) + glow * a
-        self.acc[self.acc < 0.004] = 0
-
-        rgb = self.rgb
-        if self.rainbow:
-            rgb = np.array(colorsys.hsv_to_rgb((time.time() * 0.1) % 1, 1, 1), np.float32)
-        alpha = self.acc * self.args.intensity
-        out = np.empty((self.h, self.w, 4), np.uint8)
-        out[..., :3] = (alpha[..., None] * rgb * 255).astype(np.uint8)  # premultiplied
-        out[..., 3] = (alpha * 255).astype(np.uint8)
-
-        rows, cols = np.where(self.acc.any(1))[0], np.where(self.acc.any(0))[0]
-        rect = None
-        if len(rows):
-            rect = (cols[0] / self.w, rows[0] / self.h, (cols[-1] + 1) / self.w, (rows[-1] + 1) / self.h)
-        return out, rect
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as e:
+            print(f"config.json ignoriert ({e})")
+    return cfg
 
 
-class PlayerPicker:
-    """Wählt das Spieler-Auto: in der Verfolgerkamera groß, mittig, unten im Bild.
-    Einmal gefunden, folgt die Auswahl dem Auto (Überlappung mit dem letzten Frame)."""
+def save_config(cfg):
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
-    def __init__(self, w, h):
-        self.w, self.h = w, h
-        self.last = None  # letzte Box (x0, y0, x1, y1)
-        self.lost = 0
+
+def color_rgb(c):
+    if c == "rainbow":
+        return np.array(colorsys.hsv_to_rgb((time.time() * 0.1) % 1, 1, 1), np.float32)
+    c = c.lstrip("#")
+    return np.array([int(c[i:i + 2], 16) for i in (0, 2, 4)], np.float32) / 255
+
+
+class Telemetry(threading.Thread):
+    """Empfängt Forza-Data-Out-Pakete. Felder im Fahrzeug-Koordinatensystem: X rechts, Y oben, Z vorne."""
+
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", port))
+        self.state = None
+        self.count = 0
+
+    def run(self):
+        while True:
+            data = self.sock.recv(2048)
+            if len(data) < 84:
+                continue
+            self.count += 1
+            self.state = {
+                "t": time.time(),
+                "race_on": struct.unpack_from("<i", data, 0)[0] != 0,
+                "accel": struct.unpack_from("<3f", data, 20),
+                "vel": struct.unpack_from("<3f", data, 32),
+                "ang_vel": struct.unpack_from("<3f", data, 44),
+                "susp": struct.unpack_from("<4f", data, 68),  # FL, FR, RL, RR; 0 = ausgefedert, 1 = eingefedert
+            }
+
+
+class GlowModel:
+    """Lichtschein als Textur auf der Bodenebene (Draufsicht, Zeile 0 = vorne)."""
+
+    PPM = 28  # Texel pro Meter
+
+    def __init__(self, cfg):
+        hw, hl, reach = cfg["car_width"] / 2, cfg["car_length"] / 2, cfg["glow_reach"]
+        self.hx, self.hz = hw + reach * 2.5, hl + reach * 2.5
+        xs = -self.hx + (np.arange(int(2 * self.hx * self.PPM)) + 0.5) / self.PPM
+        zs = self.hz - (np.arange(int(2 * self.hz * self.PPM)) + 0.5) / self.PPM
+        X, Z = np.meshgrid(xs.astype(np.float32), zs.astype(np.float32))
+        self.tw, self.th = X.shape[1], X.shape[0]
+
+        # Abgerundetes Rechteck als Fahrzeugumriss (vorzeichenbehaftete Distanz, außen > 0)
+        r = 0.35
+        qx, qz = np.abs(X) - (hw - r), np.abs(Z) - (hl - r)
+        d = np.hypot(np.maximum(qx, 0), np.maximum(qz, 0)) + np.minimum(np.maximum(qx, qz), 0) - r
+        g_row, g_col = np.gradient(d)
+        nx, nz = g_col, -g_row  # Zeilen laufen nach hinten
+        n = np.hypot(nx, nz) + 1e-6
+        self.nx, self.nz = nx / n, nz / n
+
+        outside = np.exp(-np.maximum(d, 0) / (0.35 * reach)) + 0.12 * np.exp(-np.maximum(d, 0) / (0.8 * reach))
+        inside = 1.3 * np.exp(np.minimum(d, 0) / 0.15)
+        # zum Texturrand hin weich ausblenden, sonst sieht man harte Kanten
+        edge = np.minimum(self.hx - np.abs(X), self.hz - np.abs(Z))
+        fade = np.clip(edge / (0.8 * reach), 0, 1) ** 2
+        self.base = (np.where(d > 0, outside, inside) * fade).astype(np.float32)
+        self.u = np.clip((X / hw + 1) / 2, 0, 1)  # 0 = links, 1 = rechts
+        self.v = np.clip((Z / hl + 1) / 2, 0, 1)  # 0 = hinten, 1 = vorne
+        self.outline = self._outline(hw, hl, r)
 
     @staticmethod
-    def iou(a, b):
-        ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
-        iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
-        inter = ix * iy
-        union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-        return inter / union if union > 0 else 0
+    def _outline(hw, hl, r):
+        pts = []
+        for cx, cz, a0 in ((hw - r, hl - r, 0), (-hw + r, hl - r, 90), (-hw + r, -hl + r, 180), (hw - r, -hl + r, 270)):
+            for a in range(a0, a0 + 91, 15):
+                pts.append((cx + r * math.cos(math.radians(a)), cz + r * math.sin(math.radians(a))))
+        return pts
 
-    def pick(self, boxes):
-        best, best_score = None, 0.0
-        for i, b in enumerate(boxes):
-            bw, bh = b[2] - b[0], b[3] - b[1]
-            cx, bottom = (b[0] + b[2]) / 2 / self.w, b[3] / self.h
-            area = bw * bh / (self.w * self.h)
-            # Verfolgerkamera-Zone: horizontal mittig, untere Bildhälfte, nicht winzig
-            score = 0.0
-            if abs(cx - 0.5) < 0.3 and bottom > 0.55 and bw / self.w > 0.1:
-                score = area * (1.5 - abs(cx - 0.5)) * bottom
-            if self.last is not None:
-                score += self.iou(b, self.last) * 2  # Kontinuität schlägt Position
-            if score > best_score:
-                best, best_score = i, score
-        if best is None:
-            self.lost += 1
-            if self.lost > 15:  # ~0.25 s weg -> neu suchen
-                self.last = None
-            return None
-        self.last, self.lost = boxes[best], 0
-        return best
+    def texture(self, theta, corners, rgb, alpha):
+        # Richtung zur Kamera im Fahrzeugsystem: weggedrehte Seiten verdeckt die Karosserie
+        tx, tz = math.sin(theta), -math.cos(theta)
+        vis = np.clip(0.75 + 0.9 * (self.nx * tx + self.nz * tz), 0, 1)
+        fl, fr, rl, rr = corners
+        u, v = self.u, self.v
+        c = (rl * (1 - u) + rr * u) * (1 - v) + (fl * (1 - u) + fr * u) * v
+        a = np.clip(self.base * vis * c, 0, 1) * alpha
+        out = np.empty((self.th, self.tw, 4), np.uint8)
+        out[..., :3] = (a[..., None] * rgb * 255).astype(np.uint8)  # premultiplied
+        out[..., 3] = (a * 255).astype(np.uint8)
+        return QtGui.QImage(out.data, self.tw, self.th, self.tw * 4,
+                            QtGui.QImage.Format_RGBA8888_Premultiplied).copy()
 
+    def homography(self, cfg, W, H, theta, zoom, shift_x):
+        """3x3-Matrix: Texel -> Bildschirm (Texel -> Fahrzeug -> Welt -> Verfolgerkamera)."""
+        T = np.array([[1 / self.PPM, 0, -self.hx], [0, -1 / self.PPM, self.hz], [0, 0, 1]])
+        return self.ground_to_screen(cfg, W, H, theta, zoom, shift_x) @ T
 
-class Capture:
-    """Windows: DXGI Desktop Duplication (dxcam, läuft auf der GPU, sehr schnell).
-    Sonst / Fallback: mss."""
-
-    def __init__(self, monitor, fps):
-        self.cam = None
-        if sys.platform == "win32":
-            try:
-                import dxcam
-                self.cam = dxcam.create(output_idx=monitor - 1, output_color="BGR")
-                self.cam.start(target_fps=int(fps), video_mode=True)
-                if self.cam.get_latest_frame() is None:
-                    raise RuntimeError("kein Bild")
-                self.name = "DXGI"
-            except Exception as e:  # noqa: BLE001
-                print(f"dxcam nicht verfügbar ({e}), nutze mss")
-                self.cam = None
-        if self.cam is None:
-            self.sct = mss.mss()
-            self.mon = self.sct.monitors[monitor]
-            self.name = "GDI"
-
-    def grab(self):
-        if self.cam is not None:
-            return self.cam.get_latest_frame()  # wartet auf das nächste Bild
-        return np.asarray(self.sct.grab(self.mon))[..., :3]
+    @staticmethod
+    def ground_to_screen(cfg, W, H, theta, zoom, shift_x):
+        c, s = math.cos(theta), math.sin(theta)
+        R = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])
+        ch, cd = cfg["cam_height"], cfg["cam_dist"]
+        phi = math.atan2(ch, cd)  # Kamera blickt auf die Fahrzeugmitte am Boden
+        sp, cp = math.sin(phi), math.cos(phi)
+        M = np.array([[1, 0, 0], [0, sp, cd * sp - ch * cp], [0, cp, ch * sp + cd * cp]])
+        F = cfg["scale"] * zoom * W * 0.75 * math.hypot(ch, cd) / 6.3
+        K = np.array([[F, 0, (cfg["anchor_x"] + shift_x) * W], [0, -F, cfg["anchor_y"] * H], [0, 0, 1]])
+        return K @ M @ R
 
 
-class Bridge(QtCore.QObject):
-    frame = QtCore.Signal(QtGui.QImage, object)
-    status = QtCore.Signal(str)
+def apply_h(Hm, pts):
+    p = np.c_[np.asarray(pts, float), np.ones(len(pts))] @ Hm.T
+    return p[:, :2] / p[:, 2:3]
+
+
+class Hotkeys:
+    """Globale Tasten per GetAsyncKeyState (funktioniert auch, wenn Forza den Fokus hat). Nur Windows."""
+
+    def __init__(self):
+        self.user32 = ctypes.windll.user32 if sys.platform == "win32" else None
+        self.prev = {}
+
+    def down(self, vk):
+        return bool(self.user32 and self.user32.GetAsyncKeyState(vk) & 0x8000)
+
+    def pressed(self, vk):
+        d = self.down(vk)
+        was, self.prev[vk] = self.prev.get(vk, False), d
+        return d and not was
+
+
+VK = dict(F8=0x77, F9=0x78, F10=0x79, LEFT=0x25, UP=0x26, RIGHT=0x27, DOWN=0x28,
+          PGUP=0x21, PGDN=0x22, END=0x23, HOME=0x24, INS=0x2D, DEL=0x2E, SHIFT=0x10)
 
 
 class Overlay(QtWidgets.QWidget):
-    def __init__(self, geom, hud=True):
+    def __init__(self, geom, cfg, tel):
         super().__init__(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint
                          | QtCore.Qt.Tool | QtCore.Qt.WindowTransparentForInput)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
         self.setGeometry(geom)
-        self.img = None
+        self.cfg, self.tel = cfg, tel
+        self.model = GlowModel(cfg)
+        self.keys = Hotkeys()
+        self.enabled, self.calib = True, False
+        self.started = time.time()
+        # geglätteter Zustand
+        self.theta, self.zoom, self.shift, self.opacity = 0.0, 1.0, 0.0, 0.0
+        self.corners = np.ones(4)
+        self.tex, self.xform, self.outline = None, None, None
         self.dirty = QtCore.QRect()
-        self.hud = hud
-        self.hud_rect = QtCore.QRect(0, 0, 1600, 70)
-        self.status = "Lade Modell ..."
+        self.hud_text, self.hud_rect = "", QtCore.QRect(10, 10, 900, 130)
+        self.last_count, self.rate, self.rate_t = 0, 0, time.time()
+
+        self.timer = QtCore.QTimer(self, interval=16, timeout=self.tick)
+        self.timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.timer.start()
         # Spiele, die nach dem Overlay starten, schieben sich gern davor -> regelmäßig nach vorne holen
-        self.topmost_timer = QtCore.QTimer(self, interval=2000, timeout=self.keep_on_top)
-        self.topmost_timer.start()
+        self.top_timer = QtCore.QTimer(self, interval=2000, timeout=self.keep_on_top)
+        self.top_timer.start()
 
     def keep_on_top(self):
         if sys.platform == "win32":
@@ -240,133 +231,146 @@ class Overlay(QtWidgets.QWidget):
         else:
             self.raise_()
 
-    def exclude_from_capture(self):
-        # Windows 10 2004+: Overlay unsichtbar für die eigene Bildschirmaufnahme
-        # (verhindert, dass YOLO den eigenen Lichtschein sieht).
-        if sys.platform == "win32":
-            ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x11)
+    def handle_keys(self):
+        k, cfg = self.keys, self.cfg
+        if k.pressed(VK["F10"]):
+            self.enabled = not self.enabled
+        if k.pressed(VK["F9"]):
+            i = COLORS.index(cfg["color"]) if cfg["color"] in COLORS else -1
+            cfg["color"] = COLORS[(i + 1) % len(COLORS)]
+            save_config(cfg)
+        if k.pressed(VK["F8"]):
+            self.calib = not self.calib
+            if not self.calib:
+                save_config(cfg)
+        if not self.calib:
+            return
+        f = 0.2 if k.down(VK["SHIFT"]) else 1.0
+        step = {"LEFT": ("anchor_x", -0.001), "RIGHT": ("anchor_x", 0.001),
+                "UP": ("anchor_y", -0.001), "DOWN": ("anchor_y", 0.001),
+                "PGUP": ("scale", 0.005), "PGDN": ("scale", -0.005),
+                "HOME": ("cam_height", 0.02), "END": ("cam_height", -0.02),
+                "INS": ("car_length", 0.01), "DEL": ("car_length", -0.01)}
+        rebuild = False
+        for key, (name, delta) in step.items():
+            if k.down(VK[key]):
+                cfg[name] = round(max(0.05, cfg[name] + delta * f), 4)
+                rebuild |= name == "car_length"
+        if rebuild:
+            self.model = GlowModel(cfg)
 
-    def set_image(self, img, rect):
-        # Nur den Bereich neu zeichnen, in dem Licht war oder ist – ein Vollbild-Neuzeichnen
-        # des transparenten Fensters wäre der teuerste Schritt.
-        self.img = img
-        r = QtCore.QRect()
-        if rect is not None:
-            W, H = self.width(), self.height()
-            r = QtCore.QRect(QtCore.QPoint(int(rect[0] * W), int(rect[1] * H)),
-                             QtCore.QPoint(int(rect[2] * W), int(rect[3] * H))).adjusted(-4, -4, 4, 4)
-        dirty = r.united(self.dirty)
+    def tick(self):
+        self.handle_keys()
+        cfg, st, now = self.cfg, self.tel.state, time.time()
+        live = st is not None and now - st["t"] < 0.5 and st["race_on"]
+
+        theta, zoom, shift, corners = 0.0, 1.0, 0.0, np.ones(4)
+        if live:
+            vx, _, vz = st["vel"]
+            speed = math.hypot(vx, vz)
+            # Driftwinkel: Kamera folgt eher der Fahrtrichtung -> Auto steht schräg im Bild
+            beta = math.atan2(vx, abs(vz)) * min(1.0, speed / 5)
+            theta = -cfg["slip_follow"] * beta + cfg["yaw_lag"] * st["ang_vel"][1]
+            ax, _, az = st["accel"]
+            zoom = 1 - cfg["accel_zoom"] * max(-15, min(15, az))
+            shift = cfg["lateral_shift"] * max(-15, min(15, ax))
+            corners = np.clip(0.7 + 0.8 * np.array(st["susp"]), 0.3, 1.5)
+
+        a = cfg["smoothing"]
+        self.theta += (theta - self.theta) * a
+        self.zoom += (zoom - self.zoom) * a
+        self.shift += (shift - self.shift) * a
+        self.corners += (corners - self.corners) * a
+        target = 1.0 if self.enabled and (live or self.calib) else 0.0
+        self.opacity += (target - self.opacity) * 0.15
+
+        W, H = self.width(), self.height()
+        rect = QtCore.QRect()
+        if self.opacity > 0.01:
+            Hm = self.model.homography(cfg, W, H, self.theta, self.zoom, self.shift)
+            self.tex = self.model.texture(self.theta, self.corners, color_rgb(cfg["color"]),
+                                          cfg["intensity"] * self.opacity)
+            self.xform = QtGui.QTransform(*Hm.T.flatten())
+            m = self.model
+            corners_px = apply_h(Hm, [(0, 0), (m.tw, 0), (m.tw, m.th), (0, m.th)])
+            lo, hi = corners_px.min(0), corners_px.max(0)
+            rect = QtCore.QRect(int(lo[0]) - 4, int(lo[1]) - 4, int(hi[0] - lo[0]) + 8, int(hi[1] - lo[1]) + 8)
+            self.outline = None
+            if self.calib:
+                Hg = GlowModel.ground_to_screen(cfg, W, H, self.theta, self.zoom, self.shift)
+                self.outline = QtGui.QPolygonF([QtCore.QPointF(*p) for p in apply_h(Hg, m.outline)])
+        else:
+            self.tex = None
+        # nur geänderte Bereiche neu zeichnen (Vollbild-Neuzeichnen wäre teuer)
+        dirty = rect.united(self.dirty)
         if not dirty.isEmpty():
             self.update(dirty)
-        self.dirty = r
+        self.dirty = rect
+        self.update_hud(live, now)
 
-    def set_status(self, text):
-        self.status = text
-        if self.hud:
+    def update_hud(self, live, now):
+        if now - self.rate_t >= 1:
+            self.rate, self.last_count, self.rate_t = self.tel.count - self.last_count, self.tel.count, now
+        cfg = self.cfg
+        if self.calib:
+            text = ("KALIBRIERUNG  (F8 = fertig & speichern)\n"
+                    "Pfeiltasten: verschieben   Bild auf/ab: Größe   Pos1/Ende: Perspektive   Einfg/Entf: Länge\n"
+                    "Shift = fein   |   Umriss = Fahrzeug-Fußabdruck, an die Reifen anlegen\n"
+                    f"x={cfg['anchor_x']:.3f} y={cfg['anchor_y']:.3f} Größe={cfg['scale']:.3f} "
+                    f"Kamerahöhe={cfg['cam_height']:.2f} Länge={cfg['car_length']:.2f}   Telemetrie: {self.rate}/s")
+        elif self.rate == 0:
+            text = (f"Warte auf Forza-Telemetrie an 127.0.0.1:{cfg['port']} ...\n"
+                    "Forza: Einstellungen > HUD und Gameplay > Data Out = An, IP 127.0.0.1, Port wie oben")
+        elif now - self.started < 8:
+            text = f"Underglow aktiv ({self.rate} Pakete/s)   F8 kalibrieren   F9 Farbe   F10 an/aus"
+        else:
+            text = ""
+        if text != self.hud_text:
+            self.hud_text = text
             self.update(self.hud_rect)
 
     def paintEvent(self, _):
         p = QtGui.QPainter(self)
-        if self.img is not None:
+        if self.tex is not None:
             p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-            p.drawImage(self.rect(), self.img)
-        if self.hud:
+            p.setTransform(self.xform)
+            p.drawImage(0, 0, self.tex)
+            p.resetTransform()
+        if self.calib and self.outline is not None:
+            p.setRenderHint(QtGui.QPainter.Antialiasing)
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 220), 2, QtCore.Qt.DashLine))
+            p.drawPolygon(self.outline)
+        if self.hud_text:
             p.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Bold))
-            r = p.fontMetrics().boundingRect(self.status).adjusted(-8, -4, 8, 4).translated(20, 30)
-            p.fillRect(r, QtGui.QColor(0, 0, 0, 160))
+            r = p.fontMetrics().boundingRect(self.hud_rect, 0, self.hud_text).adjusted(-8, -6, 8, 6)
+            r.moveTopLeft(QtCore.QPoint(20, 20))
+            p.fillRect(r, QtGui.QColor(0, 0, 0, 170))
             p.setPen(QtGui.QColor(0, 229, 255))
-            p.drawText(r, QtCore.Qt.AlignCenter, self.status)
-
-
-def worker(args, bridge, stop):
-    model = YOLO(args.model)
-    cuda = _cuda()
-    device = "GPU" if cuda else "CPU (langsam)"
-    cap = Capture(args.monitor, args.max_fps)
-    shot = cap.grab()
-    ww = args.work_width
-    wh = int(shot.shape[0] * ww / shot.shape[1])
-    renderer = GlowRenderer(args, (ww, wh))
-    picker = PlayerPicker(ww, wh)
-    frame_dt = 1 / args.max_fps
-    t_fps, n = time.time(), 0
-    t_cap = t_det = t_glow = 0.0
-    while not stop.is_set():
-        t0 = time.perf_counter()
-        shot = cap.grab()
-        if shot is None:
-            continue
-        black = shot[::32, ::32].mean() < 3
-        frame = cv2.resize(shot, (ww, wh), interpolation=cv2.INTER_LINEAR)
-        t1 = time.perf_counter()
-
-        res = model.predict(frame, imgsz=args.imgsz, conf=args.conf, classes=VEHICLES,
-                            half=cuda, verbose=False)[0]
-        polys = []
-        if res.masks is not None:
-            xy = res.masks.xy
-            if args.all_cars:
-                polys = [p for p in xy if len(p) >= 3]
-            else:
-                i = picker.pick(res.boxes.xyxy.cpu().numpy())
-                if i is not None and len(xy[i]) >= 3:
-                    polys = [xy[i]]
-        elif not args.all_cars:
-            picker.pick([])
-        t2 = time.perf_counter()
-
-        out, rect = renderer.render(polys)
-        img = QtGui.QImage(out.data, renderer.w, renderer.h, renderer.w * 4,
-                           QtGui.QImage.Format_RGBA8888_Premultiplied).copy()
-        bridge.frame.emit(img, rect)
-        t3 = time.perf_counter()
-        t_cap, t_det, t_glow = t_cap + t1 - t0, t_det + t2 - t1, t_glow + t3 - t2
-
-        n += 1
-        if time.time() - t_fps > 1:
-            if black:
-                msg = "Bildschirmaufnahme ist schwarz - Forza auf 'Randloses Fenster' stellen"
-            else:
-                ms = lambda t: f"{t / n * 1000:.0f}"  # noqa: E731
-                who = "alle Autos" if args.all_cars else ("Spieler-Auto" if polys else "kein Spieler-Auto")
-                msg = (f"Underglow | {device} | {n / (time.time() - t_fps):.0f} FPS | {who} | "
-                       f"Aufnahme ({cap.name}) {ms(t_cap)} ms, Erkennung {ms(t_det)} ms, Glow {ms(t_glow)} ms")
-            bridge.status.emit(msg)
-            print("\r" + msg + "     ", end="", flush=True)
-            t_fps, n = time.time(), 0
-            t_cap = t_det = t_glow = 0.0
-        if cap.cam is None:  # dxcam taktet selbst
-            time.sleep(max(0.0, frame_dt - (time.perf_counter() - t0)))
-
-
-def _cuda():
-    import torch
-    return torch.cuda.is_available()
+            p.drawText(r.adjusted(8, 6, -8, -6), 0, self.hud_text)
 
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser(description="Underglow-Overlay für Forza Horizon (Telemetrie)")
+    ap.add_argument("--screen", type=int, default=0, help="Bildschirm-Index (0 = primär)")
+    args = ap.parse_args()
     signal.signal(signal.SIGINT, signal.SIG_DFL)  # Strg+C im Terminal beendet
     app = QtWidgets.QApplication(sys.argv)
 
-    with mss.mss() as sct:
-        mon = sct.monitors[args.monitor]
-    dpr = app.primaryScreen().devicePixelRatio()  # mss liefert physische Pixel
-    geom = QtCore.QRect(*(int(round(mon[k] / dpr)) for k in ("left", "top", "width", "height")))
+    cfg = load_config()
+    if not CONFIG_PATH.exists():
+        save_config(cfg)
+    try:
+        tel = Telemetry(cfg["port"])
+    except OSError as e:
+        sys.exit(f"Port {cfg['port']} ist belegt ({e}). Läuft das Overlay schon?")
+    tel.start()
 
-    overlay = Overlay(geom, hud=not args.no_hud)
+    screens = app.screens()
+    screen = screens[args.screen] if args.screen < len(screens) else app.primaryScreen()
+    overlay = Overlay(screen.geometry(), cfg, tel)
     overlay.show()
-    overlay.exclude_from_capture()
-
-    bridge = Bridge()
-    bridge.frame.connect(overlay.set_image)
-    bridge.status.connect(overlay.set_status)
-    stop = threading.Event()
-    threading.Thread(target=worker, args=(args, bridge, stop), daemon=True).start()
-    print("Underglow läuft – Strg+C im Terminal zum Beenden.")
-    code = app.exec()
-    stop.set()
-    sys.exit(code)
+    print(f"Underglow läuft (Telemetrie auf Port {cfg['port']}). Strg+C oder Fenster schließen zum Beenden.")
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -9,6 +9,6 @@ where uv >nul 2>nul || (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
 )
 
-echo Starte Underglow (erster Start laedt ca. 3 GB herunter, das dauert etwas) ...
+echo Starte Underglow ... (erster Start laedt ca. 100 MB)
 uv run underglow.py %*
 pause

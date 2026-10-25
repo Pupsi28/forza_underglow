@@ -1,52 +1,48 @@
 # Forza Underglow Overlay
 
-Erkennt Autos auf dem Bildschirm (YOLO-Segmentierung) und legt in Echtzeit eine
-Unterbodenbeleuchtung als transparentes, klick-durchlässiges Overlay darüber.
+Unterbodenbeleuchtung für Forza Horizon 6 als transparentes Overlay. Statt Bilderkennung
+nutzt es Forzas **Data-Out-Telemetrie**: läuft ohne Verzögerung mit 60 FPS, flackert nicht
+und braucht praktisch keine GPU-Leistung.
 
-## Start
-- **Windows:** `run.bat` doppelklicken
-- **Linux:** `./run.sh`
+## Einrichtung (einmalig)
+1. In Forza: **Einstellungen → HUD und Gameplay → Data Out = An**,
+   IP `127.0.0.1`, Port `1306`.
+2. Forza im **randlosen Fenstermodus** spielen (exklusives Vollbild verdeckt Overlays).
+3. `run.bat` starten. Beim ersten Mal lädt es automatisch Python + Pakete (~100 MB),
+   vorher muss nichts installiert werden.
+4. Im Spiel in der Verfolgerkamera **F8** drücken und den gestrichelten Umriss an die Reifen
+   anlegen (siehe unten). **F8** speichert.
 
-Es muss **nichts vorher installiert werden**. `run.bat` holt sich beim ersten Start
-[uv](https://docs.astral.sh/uv/), das wiederum Python, PyTorch (mit GPU-Support) und das
-Erkennungsmodell herunterlädt (einmalig ca. 3 GB). Danach startet es in Sekunden.
-
-1. Forza starten, in den Grafikeinstellungen **Randloses Fenster** statt Vollbild wählen.
-2. `run.bat` starten.
-3. Oben links erscheint eine Statuszeile (FPS, Anzahl erkannter Autos). Ausblenden mit `--no-hud`.
-
-Beenden: Fenster schließen oder Strg+C im Terminal.
-
-### Fehlersuche
-| Statuszeile | Bedeutung |
+## Tasten (funktionieren, während Forza im Vordergrund ist)
+| Taste | Funktion |
 |---|---|
-| nicht sichtbar | Forza läuft im exklusiven Vollbild → auf randloses Fenster umstellen |
-| „Bildschirmaufnahme ist schwarz" | dito |
-| „0 Auto(s)" | Erkennung greift nicht → `run.bat --conf 0.15` oder `--model yolo11s-seg.pt` |
-| Aufnahme / Erkennung / Glow in ms | zeigt, welcher Schritt bremst |
-| „CPU (langsam)" | keine NVIDIA-GPU gefunden, läuft trotzdem, nur mit weniger FPS |
+| F8 | Kalibrierung an/aus (speichert beim Verlassen) |
+| F9 | Farbe wechseln (inkl. Regenbogen) |
+| F10 | Underglow an/aus (z. B. für Cockpit-Ansicht) |
 
-## Optionen
-```
-run.bat --color "#ff00aa"      # Farbe
-run.bat --color rainbow        # Farbwechsel
-run.bat --all-cars             # alle Autos statt nur dem eigenen
-run.bat --imgsz 320            # schnellere, etwas ungenauere Erkennung
-run.bat --intensity 0.6 --spread 1.3
-run.bat --model yolo11s-seg.pt # genauer, langsamer
-```
+Im Kalibriermodus: **Pfeiltasten** verschieben, **Bild auf/ab** Größe, **Pos1/Ende**
+Perspektive, **Einfg/Entf** Fahrzeuglänge, **Shift** gedrückt halten für feine Schritte.
+Am besten stehend kalibrieren, damit die Pfeiltasten nicht das Auto lenken.
 
 ## Wie es funktioniert
-Aus der Segmentierungsmaske wird die Unterkante des Autos (Reifen/Schweller) ermittelt.
-Deren konvexe Hülle ≈ Fußabdruck auf dem Boden → funktioniert in Seiten-, Heck- und
-Schrägansicht. Der Schein wird weichgezeichnet, von der Karosserie verdeckt und zeitlich
-geglättet, damit er bei Kamerabewegungen nicht flackert.
+In der Verfolgerkamera steht das eigene Auto immer an ungefähr derselben Bildschirmstelle.
+Der Lichtschein wird auf einer virtuellen Bodenebene berechnet und perspektivisch projiziert.
+Die Telemetrie bewegt ihn mit:
+- **Driftwinkel** → Auto und Licht drehen sich im Bild
+- **Federweg pro Rad** → eingefederte Ecken leuchten heller
+- **Beschleunigen/Bremsen** → Kamera fällt zurück/holt auf
+- Seiten, die von der Kamera wegzeigen, verdeckt die Karosserie
 
-## Hinweise
-- **GPU:** Unter Windows wird automatisch PyTorch mit CUDA installiert (NVIDIA). Ohne NVIDIA-GPU
-  läuft es auf der CPU mit ca. 5–15 FPS.
-- Unter Windows wird das Overlay aus der Bildschirmaufnahme ausgeblendet. Unter Linux geht das
-  nicht – dort sieht die Erkennung ihren eigenen Schein (meist unkritisch). Linux braucht X11
-  mit Compositor.
-- Reines Screen-Capture-Overlay, kein Eingriff in den Spielprozess.
-# forza_underglow
+## Feintuning (`config.json`, wird beim ersten Start angelegt)
+- `color`, `intensity`, `glow_reach`: Farbe, Helligkeit, Reichweite des Lichts
+- `slip_follow`: wie stark sich der Schein beim Driften dreht
+- `yaw_lag`, `lateral_shift`: Kamera-Nachziehen in Kurven (Standard aus; falls genutzt
+  und es in die falsche Richtung geht, Vorzeichen umdrehen)
+- `smoothing`: kleiner = ruhiger, größer = direkter
+- `port`: falls in Forza ein anderer Port eingestellt ist
+
+## Grenzen
+- Gedacht für die **Verfolgerkamera**. In Cockpit-/Motorhaubenansicht mit F10 ausschalten.
+  Fotomodus/freie Kamera funktioniert nicht (die Telemetrie kennt die Kameraposition nicht).
+- Fahrzeuge unterschiedlicher Größe sitzen evtl. leicht anders → kurz mit F8 nachjustieren.
+- Linux: läuft, aber ohne globale Tasten (Einstellungen dann direkt in `config.json`).
