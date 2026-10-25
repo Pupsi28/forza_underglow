@@ -33,3 +33,4 @@ geglättet, damit er bei Kamerabewegungen nicht flackert.
   nicht – dort sieht die Erkennung ihren eigenen Schein (meist unkritisch). Linux braucht X11
   mit Compositor.
 - Reines Screen-Capture-Overlay, kein Eingriff in den Spielprozess.
+# forza_underglow
