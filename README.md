@@ -23,12 +23,15 @@ Beenden: Fenster schließen oder Strg+C im Terminal.
 | nicht sichtbar | Forza läuft im exklusiven Vollbild → auf randloses Fenster umstellen |
 | „Bildschirmaufnahme ist schwarz" | dito |
 | „0 Auto(s)" | Erkennung greift nicht → `run.bat --conf 0.15` oder `--model yolo11s-seg.pt` |
+| Aufnahme / Erkennung / Glow in ms | zeigt, welcher Schritt bremst |
 | „CPU (langsam)" | keine NVIDIA-GPU gefunden, läuft trotzdem, nur mit weniger FPS |
 
 ## Optionen
 ```
 run.bat --color "#ff00aa"      # Farbe
 run.bat --color rainbow        # Farbwechsel
+run.bat --all-cars             # alle Autos statt nur dem eigenen
+run.bat --imgsz 320            # schnellere, etwas ungenauere Erkennung
 run.bat --intensity 0.6 --spread 1.3
 run.bat --model yolo11s-seg.pt # genauer, langsamer
 ```
