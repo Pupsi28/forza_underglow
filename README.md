@@ -7,9 +7,23 @@ Unterbodenbeleuchtung als transparentes, klick-durchlässiges Overlay darüber.
 - **Windows:** `run.bat` doppelklicken
 - **Linux:** `./run.sh`
 
-Beim ersten Start werden die Abhängigkeiten installiert und das Modell (~6 MB) geladen.
-Forza im **randlosen Fenstermodus** laufen lassen (Vollbild-exklusiv verdeckt Overlays).
-Beenden: Strg+C im Terminal.
+Es muss **nichts vorher installiert werden**. `run.bat` holt sich beim ersten Start
+[uv](https://docs.astral.sh/uv/), das wiederum Python, PyTorch (mit GPU-Support) und das
+Erkennungsmodell herunterlädt (einmalig ca. 3 GB). Danach startet es in Sekunden.
+
+1. Forza starten, in den Grafikeinstellungen **Randloses Fenster** statt Vollbild wählen.
+2. `run.bat` starten.
+3. Oben links erscheint eine Statuszeile (FPS, Anzahl erkannter Autos). Ausblenden mit `--no-hud`.
+
+Beenden: Fenster schließen oder Strg+C im Terminal.
+
+### Fehlersuche
+| Statuszeile | Bedeutung |
+|---|---|
+| nicht sichtbar | Forza läuft im exklusiven Vollbild → auf randloses Fenster umstellen |
+| „Bildschirmaufnahme ist schwarz" | dito |
+| „0 Auto(s)" | Erkennung greift nicht → `run.bat --conf 0.15` oder `--model yolo11s-seg.pt` |
+| „CPU (langsam)" | keine NVIDIA-GPU gefunden, läuft trotzdem, nur mit weniger FPS |
 
 ## Optionen
 ```
@@ -26,9 +40,8 @@ Schrägansicht. Der Schein wird weichgezeichnet, von der Karosserie verdeckt und
 geglättet, damit er bei Kamerabewegungen nicht flackert.
 
 ## Hinweise
-- **GPU:** Für flüssige FPS eine CUDA-Version von PyTorch installieren
-  (`.venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu124`).
-  Auf CPU läuft es, aber eher mit 5–15 FPS.
+- **GPU:** Unter Windows wird automatisch PyTorch mit CUDA installiert (NVIDIA). Ohne NVIDIA-GPU
+  läuft es auf der CPU mit ca. 5–15 FPS.
 - Unter Windows wird das Overlay aus der Bildschirmaufnahme ausgeblendet. Unter Linux geht das
   nicht – dort sieht die Erkennung ihren eigenen Schein (meist unkritisch). Linux braucht X11
   mit Compositor.
